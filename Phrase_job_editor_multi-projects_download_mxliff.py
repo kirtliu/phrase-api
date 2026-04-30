@@ -4,6 +4,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import concurrent.futures
+import threading
 import logging
 import time
 import json
@@ -307,6 +308,27 @@ def get_unique_filename(directory, filename):
     return new_filename
 
 
+def reserve_unique_filename(directory, filename, lock):
+    """ 在 lock 保護下，原子性地保留唯一檔名（透過 O_CREAT|O_EXCL 建立空檔佔位）
+        避免多執行緒同時通過 get_unique_filename 後互相覆蓋的 race condition """
+    base_name, extension = os.path.splitext(filename)
+    counter = 0
+    with lock:
+        while True:
+            if counter == 0:
+                candidate = filename
+            else:
+                candidate = f"{base_name} ({counter}){extension}"
+            candidate_path = os.path.join(directory, candidate)
+            try:
+                # O_CREAT|O_EXCL: 若檔案已存在會丟 FileExistsError，存在則嘗試下一個編號
+                fd = os.open(candidate_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.close(fd)
+                return candidate, candidate_path
+            except FileExistsError:
+                counter += 1
+
+
 def download_bilingual_files_by_language():
     """ 根據選定的語言下載雙語檔案 """
     if not API_TOKEN:
@@ -371,16 +393,8 @@ def download_bilingual_files_by_language():
                 safe_lang = target_lang.replace('/', '_')
 
                 if download_mode == "合併下載":
-                    # 合併下載：一個語言一個檔案
+                    # 合併下載：一個語言一個檔案，直接存到 save_dir
                     job_uids = [job['uid'] for job in jobs]
-
-                    # 建立語系資料夾 (加上 workflow 縮寫)
-                    if workflow_abbr:
-                        folder_name = f"{safe_lang}_{workflow_abbr}"
-                    else:
-                        folder_name = safe_lang
-                    lang_folder = os.path.join(save_dir, folder_name)
-                    os.makedirs(lang_folder, exist_ok=True)
 
                     # 建立檔案名稱: 專案名稱_語系_workflow縮寫.mxliff
                     safe_project_name = "".join(c for c in project_name if c.isalnum() or c in (' ', '-', '_')).rstrip()
@@ -390,8 +404,8 @@ def download_bilingual_files_by_language():
                         filename = f"{safe_project_name}_{safe_lang}.mxliff"
 
                     # 檢查檔名是否重複，如果重複則加上編號
-                    filename = get_unique_filename(lang_folder, filename)
-                    save_path = os.path.join(lang_folder, filename)
+                    filename = get_unique_filename(save_dir, filename)
+                    save_path = os.path.join(save_dir, filename)
 
                     # 下載合併的雙語檔案
                     result = download_bilingual_file(project_uid, job_uids, save_path)
@@ -399,20 +413,23 @@ def download_bilingual_files_by_language():
                     logging.info(f"Project {project_name} - Language {target_lang} (merged): {result}")
 
                 else:  # 單獨下載
-                    # 單獨下載：每個 job 一個檔案，使用平行下載加速
+                    # 單獨下載：建立語系子資料夾，每個 job 一個檔案，使用平行下載加速
+
+                    # 建立語系子資料夾 (加上 workflow 縮寫)
+                    if workflow_abbr:
+                        folder_name = f"{safe_lang}_{workflow_abbr}"
+                    else:
+                        folder_name = safe_lang
+                    lang_folder = os.path.join(save_dir, folder_name)
+                    os.makedirs(lang_folder, exist_ok=True)
+
+                    # 多執行緒共用的鎖，避免檔名 race condition
+                    filename_lock = threading.Lock()
 
                     def download_single_job(job):
                         """下載單一 job 的函數（用於平行處理）"""
                         job_uid = job['uid']
                         job_filename = job.get('filename', 'unknown')
-
-                        # 建立語系資料夾 (加上 workflow 縮寫)
-                        if workflow_abbr:
-                            folder_name = f"{safe_lang}_{workflow_abbr}"
-                        else:
-                            folder_name = safe_lang
-                        lang_folder = os.path.join(save_dir, folder_name)
-                        os.makedirs(lang_folder, exist_ok=True)
 
                         # 建立檔案名稱: 檔名_語系_workflow縮寫.mxliff
                         # 移除原始檔案的副檔名
@@ -427,13 +444,12 @@ def download_bilingual_files_by_language():
                         else:
                             filename = f"{safe_filename}_{safe_lang}.mxliff"
 
-                        # 檢查檔名是否重複，如果重複則加上編號
-                        filename = get_unique_filename(lang_folder, filename)
-                        save_path = os.path.join(lang_folder, filename)
+                        # 在 lock 保護下原子性地保留唯一檔名（避免多執行緒覆蓋）
+                        final_filename, save_path = reserve_unique_filename(lang_folder, filename, filename_lock)
 
-                        # 下載單一 job 的雙語檔案
+                        # 下載單一 job 的雙語檔案（會覆寫剛建立的空佔位檔）
                         result = download_bilingual_file(project_uid, [job_uid], save_path)
-                        return (job_filename, filename, result)
+                        return (job_filename, final_filename, result)
 
                     # 使用多執行緒平行下載
                     max_workers = min(10, len(jobs))  # 最多同時 10 個下載
